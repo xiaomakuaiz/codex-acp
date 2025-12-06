@@ -10,14 +10,14 @@ use std::{
 use agent_client_protocol::{
     Annotations, AudioContent, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
     BlobResourceContents, Client, ClientCapabilities, Content, ContentBlock, ContentChunk, Diff,
-    EmbeddedResource, EmbeddedResourceResource, Error, ImageContent, LoadSessionResponse, Meta,
-    ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
-    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome, SessionId, SessionMode,
-    SessionModeId, SessionModeState, SessionModelState, SessionNotification, SessionUpdate,
-    StopReason, Terminal, TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId,
-    ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
-    UnstructuredCommandInput,
+    EmbeddedResource, EmbeddedResourceResource, Error, ExtNotification, ImageContent,
+    LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
+    PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall,
+    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::{
     approval_presets::{ApprovalPreset, builtin_approval_presets},
@@ -53,7 +53,7 @@ use codex_protocol::{
 };
 use itertools::Itertools;
 use mcp_types::{CallToolResult, RequestId};
-use serde_json::json;
+use serde_json::{json, value::RawValue};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -1407,6 +1407,38 @@ impl SessionClient {
         .await;
     }
 
+    async fn send_model_state_update(&self, state: SessionModelState) {
+        let json = match serde_json::to_string(&state) {
+            Ok(json) => json,
+            Err(err) => {
+                error!("Failed to serialize model state update: {:?}", err);
+                return;
+            }
+        };
+
+        let raw = match RawValue::from_string(json) {
+            Ok(raw) => raw,
+            Err(err) => {
+                error!(
+                    "Failed to convert model state update into RawValue: {:?}",
+                    err
+                );
+                return;
+            }
+        };
+
+        if let Err(err) = self
+            .client
+            .ext_notification(ExtNotification::new(
+                "_codex/session_model_state",
+                Arc::from(raw),
+            ))
+            .await
+        {
+            error!("Failed to send model state extension notification: {:?}", err);
+        }
+    }
+
     async fn send_agent_thought(&self, text: impl Into<String>) {
         self.send_notification(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
             text.into().into(),
@@ -1883,6 +1915,19 @@ impl<A: Auth> ConversationActor<A> {
 
         self.config.model = model_to_use;
         self.config.model_reasoning_effort = effort_to_use;
+
+        match self.models() {
+            Ok(state) => {
+                self.client.send_model_state_update(state).await;
+            }
+            Err(err) => {
+                error!("Failed to compute model state after update: {:?}", err);
+            }
+        }
+
+        self.client
+            .send_agent_text(format!("Switched to model `{}`", self.config.model))
+            .await;
 
         Ok(())
     }
