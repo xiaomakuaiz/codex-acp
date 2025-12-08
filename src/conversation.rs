@@ -14,9 +14,9 @@ use agent_client_protocol::{
     LoadSessionResponse, Meta, ModelId, ModelInfo, PermissionOption, PermissionOptionKind, Plan,
     PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResourceLink, SelectedPermissionOutcome,
-    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
-    SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents, ToolCall,
-    ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    SessionId, SessionMode, SessionModeId, SessionModeState, SessionModelState,
+    SessionNotification, SessionUpdate, StopReason, Terminal, TextContent, TextResourceContents,
+    ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
 use codex_common::{
@@ -1435,7 +1435,10 @@ impl SessionClient {
             ))
             .await
         {
-            error!("Failed to send model state extension notification: {:?}", err);
+            error!(
+                "Failed to send model state extension notification: {:?}",
+                err
+            );
         }
     }
 
