@@ -296,6 +296,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             conversation,
             self.auth_manager.clone(),
+            self.conversation_manager.get_models_manager(),
             self.client_capabilities.clone(),
             config.clone(),
         ));
@@ -307,14 +308,9 @@ impl Agent for CodexAgent {
 
         debug!("Created new session with {} MCP servers", num_mcp_servers);
 
-        let mut response = NewSessionResponse::new(session_id);
-        if let Some(modes) = load.modes {
-            response = response.modes(modes);
-        }
-        if let Some(models) = load.models {
-            response = response.models(models);
-        }
-        Ok(response)
+        Ok(NewSessionResponse::new(session_id)
+            .modes(load.modes)
+            .models(load.models))
     }
 
     async fn load_session(

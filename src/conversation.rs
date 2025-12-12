@@ -19,14 +19,12 @@ use agent_client_protocol::{
     ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
-use codex_common::{
-    approval_presets::{ApprovalPreset, builtin_approval_presets},
-    model_presets::{ModelPreset, all_model_presets},
-};
+use codex_common::approval_presets::{ApprovalPreset, builtin_approval_presets};
 use codex_core::{
     AuthManager, CodexConversation,
     config::{Config, set_project_trust_level},
     error::CodexErr,
+    openai_models::models_manager::ModelsManager,
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
         AgentReasoningSectionBreakEvent, ApplyPatchApprovalRequestEvent, ElicitationAction,
@@ -37,16 +35,17 @@ use codex_core::{
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, SandboxPolicy, StreamErrorEvent, TaskCompleteEvent, TaskStartedEvent,
-        TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
-        WebSearchBeginEvent, WebSearchEndEvent,
+        TerminalInteractionEvent, TurnAbortedEvent, UserMessageEvent, ViewImageToolCallEvent,
+        WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
 use codex_protocol::{
     approvals::ElicitationRequestEvent,
-    config_types::{ReasoningEffort, TrustLevel},
+    config_types::TrustLevel,
     custom_prompts::CustomPrompt,
+    openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     user_input::UserInput,
@@ -63,7 +62,6 @@ use crate::{
 };
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
-static MODEL_PRESETS: LazyLock<&Vec<ModelPreset>> = LazyLock::new(all_model_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 
 /// Trait for abstracting over the `CodexConversation` to make testing easier.
@@ -81,6 +79,23 @@ impl CodexConversationImpl for CodexConversation {
 
     async fn next_event(&self) -> Result<Event, CodexErr> {
         self.next_event().await
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ModelsManagerImpl {
+    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String;
+    async fn list_models(&self, config: &Config) -> Vec<ModelPreset>;
+}
+
+#[async_trait::async_trait]
+impl ModelsManagerImpl for ModelsManager {
+    async fn get_model(&self, model_id: &Option<String>, config: &Config) -> String {
+        self.get_model(model_id, config).await
+    }
+
+    async fn list_models(&self, config: &Config) -> Vec<ModelPreset> {
+        self.list_models(config).await
     }
 }
 
@@ -129,6 +144,7 @@ impl Conversation {
         session_id: SessionId,
         conversation: Arc<dyn CodexConversationImpl>,
         auth: Arc<AuthManager>,
+        models_manager: Arc<dyn ModelsManagerImpl>,
         client_capabilities: Arc<Mutex<ClientCapabilities>>,
         config: Config,
     ) -> Self {
@@ -138,6 +154,7 @@ impl Conversation {
             auth,
             SessionClient::new(session_id, client_capabilities),
             conversation,
+            models_manager,
             config,
             message_rx,
         );
@@ -435,6 +452,13 @@ impl PromptState {
                 );
                 self.exec_command_end(client, end_event).await;
             }
+            EventMsg::TerminalInteraction(event) => {
+                info!(
+                    "Terminal interaction: call_id={}, process_id={}, stdin={}",
+                    event.call_id, event.process_id, event.stdin
+                );
+                self.terminal_interaction(client, event).await;
+            }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent { call_id, invocation }) => {
                 info!("MCP tool call begin: call_id={call_id}, invocation={} {}", invocation.server, invocation.tool);
                 self.start_mcp_tool_call(client, call_id, invocation).await;
@@ -589,17 +613,17 @@ impl PromptState {
                 ),
                 vec![
                     PermissionOption::new(
-                        "approved".into(),
+                        "approved",
                         "Yes, provide the requested info",
                         PermissionOptionKind::AllowOnce,
                     ),
                     PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, but continue without it",
                         PermissionOptionKind::RejectOnce,
                     ),
                     PermissionOption::new(
-                        "cancel".into(),
+                        "cancel",
                         "Cancel this request",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -697,17 +721,13 @@ impl PromptState {
                         .status(ToolCallStatus::Pending)
                         .title(title)
                         .locations(locations)
-                        .content(content.chain(reason.map(|r| r.into())).collect())
+                        .content(content.chain(reason.map(|r| r.into())).collect::<Vec<_>>())
                         .raw_input(raw_input),
                 ),
                 vec![
+                    PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                     PermissionOption::new(
-                        "approved".into(),
-                        "Yes",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, provide feedback",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -769,25 +789,26 @@ impl PromptState {
             turn_id: _,
         } = event;
 
-        let mut fields = ToolCallUpdateFields::new()
-            .status(if success {
-                ToolCallStatus::Completed
-            } else {
-                ToolCallStatus::Failed
-            })
-            .raw_output(raw_output);
-
-        if !changes.is_empty() {
+        let (title, locations, content) = if !changes.is_empty() {
             let (title, locations, content) = extract_tool_call_content_from_changes(changes);
-            fields = fields
-                .title(title)
-                .locations(locations)
-                .content(content.collect())
-        }
+            (Some(title), Some(locations), Some(content.collect()))
+        } else {
+            (None, None, None)
+        };
 
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call_id, fields,
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(if success {
+                        ToolCallStatus::Completed
+                    } else {
+                        ToolCallStatus::Failed
+                    })
+                    .raw_output(raw_output)
+                    .title(title)
+                    .locations(locations)
+                    .content(content),
             )))
             .await;
     }
@@ -822,28 +843,26 @@ impl PromptState {
             Ok(result) => serde_json::json!(result),
             Err(err) => serde_json::json!(err),
         };
-        let mut fields = ToolCallUpdateFields::new()
-            .status(if is_error {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            })
-            .raw_output(raw_output);
 
-        if let Ok(result) = result
-            && !result.content.is_empty()
-        {
-            fields = fields.content(
-                result
-                    .content
-                    .into_iter()
-                    .map(codex_content_to_acp_content)
-                    .collect(),
-            );
-        }
         client
             .send_notification(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call_id, fields,
+                call_id,
+                ToolCallUpdateFields::new()
+                    .status(if is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    })
+                    .raw_output(raw_output)
+                    .content(result.ok().filter(|result| !result.content.is_empty()).map(
+                        |result| {
+                            result
+                                .content
+                                .into_iter()
+                                .map(codex_content_to_acp_content)
+                                .collect()
+                        },
+                    )),
             )))
             .await;
     }
@@ -861,7 +880,7 @@ impl PromptState {
             cwd,
             reason,
             parsed_cmd,
-            risk,
+            proposed_execpolicy_amendment,
         } = event;
 
         // Create a new tool call for the command execution
@@ -881,50 +900,49 @@ impl PromptState {
             file_extension,
         });
 
-        let risk = risk.map(|risk| {
-            format!(
-                "Risk Assessment: {}\nRisk Level: {}",
-                risk.description,
-                risk.risk_level.as_str()
-            )
-        });
+        let mut content = vec![];
 
-        let content = match (reason, risk) {
-            (Some(reason), Some(risk)) => Some(vec![[reason, risk].join("\n").into()]),
-            (Some(reason), None) => Some(vec![reason.into()]),
-            (None, Some(risk)) => Some(vec![risk.into()]),
-            (None, None) => None,
+        if let Some(reason) = reason {
+            content.push(reason);
+        }
+        if let Some(amendment) = proposed_execpolicy_amendment {
+            content.push(format!(
+                "Proposed Amendment: {}",
+                amendment.command().join("\n")
+            ));
+        }
+
+        let content = if content.is_empty() {
+            None
+        } else {
+            Some(vec![content.join("\n").into()])
         };
-
-        let mut fields = ToolCallUpdateFields::new()
-            .kind(kind)
-            .status(ToolCallStatus::Pending)
-            .title(title)
-            .raw_input(raw_input);
-
-        if let Some(content) = content {
-            fields = fields.content(content);
-        }
-        if !locations.is_empty() {
-            fields = fields.locations(locations);
-        }
 
         let response = client
             .request_permission(
-                ToolCallUpdate::new(tool_call_id, fields),
+                ToolCallUpdate::new(
+                    tool_call_id,
+                    ToolCallUpdateFields::new()
+                        .kind(kind)
+                        .status(ToolCallStatus::Pending)
+                        .title(title)
+                        .raw_input(raw_input)
+                        .content(content)
+                        .locations(if locations.is_empty() {
+                            None
+                        } else {
+                            Some(locations)
+                        }),
+                ),
                 vec![
                     PermissionOption::new(
-                        "approved-for-session".into(),
+                        "approved-for-session",
                         "Always",
                         PermissionOptionKind::AllowAlways,
                     ),
+                    PermissionOption::new("approved", "Yes", PermissionOptionKind::AllowOnce),
                     PermissionOption::new(
-                        "approved".into(),
-                        "Yes",
-                        PermissionOptionKind::AllowOnce,
-                    ),
-                    PermissionOption::new(
-                        "abort".into(),
+                        "abort",
                         "No, provide feedback",
                         PermissionOptionKind::RejectOnce,
                     ),
@@ -983,30 +1001,32 @@ impl PromptState {
             file_extension,
             terminal_output,
         };
+        let (content, meta) = if client.supports_terminal_output(&active_command) {
+            let content = vec![ToolCallContent::Terminal(Terminal::new(call_id.clone()))];
+            let meta = Some(Meta::from_iter([(
+                "terminal_info".to_owned(),
+                serde_json::json!({
+                    "terminal_id": call_id,
+                    "cwd": cwd
+                }),
+            )]));
+            (content, meta)
+        } else {
+            (vec![], None)
+        };
 
-        let mut tool_call = ToolCall::new(tool_call_id, title)
-            .kind(kind)
-            .status(ToolCallStatus::InProgress)
-            .locations(locations)
-            .raw_input(raw_input);
-
-        if client.supports_terminal_output(&active_command) {
-            tool_call = tool_call
-                .content(vec![ToolCallContent::Terminal(Terminal::new(
-                    call_id.clone(),
-                ))])
-                .meta(Meta::from_iter([(
-                    "terminal_info".to_owned(),
-                    serde_json::json!({
-                        "terminal_id": call_id,
-                        "cwd": cwd
-                    }),
-                )]));
-        }
         self.active_command = Some(active_command);
 
         client
-            .send_notification(SessionUpdate::ToolCall(tool_call))
+            .send_notification(SessionUpdate::ToolCall(
+                ToolCall::new(tool_call_id, title)
+                    .kind(kind)
+                    .status(ToolCallStatus::InProgress)
+                    .locations(locations)
+                    .raw_input(raw_input)
+                    .content(content)
+                    .meta(meta),
+            ))
             .await;
     }
 
@@ -1086,27 +1106,81 @@ impl PromptState {
         {
             let is_success = exit_code == 0;
 
-            let mut update = ToolCallUpdate::new(
-                active_command.tool_call_id.clone(),
-                ToolCallUpdateFields::new()
-                    .status(if is_success {
-                        ToolCallStatus::Completed
-                    } else {
-                        ToolCallStatus::Failed
-                    })
-                    .raw_output(raw_output),
-            );
+            client
+                .send_notification(SessionUpdate::ToolCallUpdate(
+                    ToolCallUpdate::new(
+                        active_command.tool_call_id.clone(),
+                        ToolCallUpdateFields::new()
+                            .status(if is_success {
+                                ToolCallStatus::Completed
+                            } else {
+                                ToolCallStatus::Failed
+                            })
+                            .raw_output(raw_output),
+                    )
+                    .meta(
+                        client.supports_terminal_output(&active_command).then(|| {
+                            Meta::from_iter([(
+                                "terminal_exit".into(),
+                                serde_json::json!({
+                                    "terminal_id": call_id,
+                                    "exit_code": exit_code,
+                                    "signal": null
+                                }),
+                            )])
+                        }),
+                    ),
+                ))
+                .await;
+        }
+    }
 
-            if client.supports_terminal_output(&active_command) {
-                update = update.meta(Meta::from_iter([(
-                    "terminal_exit".into(),
+    async fn terminal_interaction(
+        &mut self,
+        client: &SessionClient,
+        event: TerminalInteractionEvent,
+    ) {
+        let TerminalInteractionEvent {
+            call_id,
+            process_id: _,
+            stdin,
+        } = event;
+
+        let stdin = format!("\n{stdin}\n");
+        // Stream output bytes to the display-only terminal via ToolCallUpdate meta.
+        if let Some(active_command) = &mut self.active_command
+            && *active_command.call_id == call_id
+        {
+            let update = if client.supports_terminal_output(active_command) {
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new(),
+                )
+                .meta(Meta::from_iter([(
+                    "terminal_output".to_owned(),
                     serde_json::json!({
                         "terminal_id": call_id,
-                        "exit_code": exit_code,
-                        "signal": null
+                        "data": stdin
                     }),
-                )]));
-            }
+                )]))
+            } else {
+                active_command.output.push_str(&stdin);
+                let content = match active_command.file_extension.as_deref() {
+                    Some("md") => active_command.output.clone(),
+                    Some(ext) => format!(
+                        "```{ext}\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                    None => format!(
+                        "```sh\n{}\n```\n",
+                        active_command.output.trim_end_matches('\n')
+                    ),
+                };
+                ToolCallUpdate::new(
+                    active_command.tool_call_id.clone(),
+                    ToolCallUpdateFields::new().content(vec![content.into()]),
+                )
+            };
 
             client
                 .send_notification(SessionUpdate::ToolCallUpdate(update))
@@ -1325,6 +1399,7 @@ impl TaskState {
             | EventMsg::ExecCommandBegin(..)
             | EventMsg::ExecCommandOutputDelta(..)
             | EventMsg::ExecCommandEnd(..)
+            | EventMsg::TerminalInteraction(..)
             | EventMsg::ViewImageToolCall(..)
             | EventMsg::ExecApprovalRequest(..)
             | EventMsg::ApplyPatchApprovalRequest(..)
@@ -1494,6 +1569,8 @@ struct ConversationActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
+    /// The models available for this conversation.
+    models_manager: Arc<dyn ModelsManagerImpl>,
     /// A sender for each interested `Op` submission that needs events routed.
     submissions: HashMap<String, SubmissionState>,
     /// A receiver for incoming conversation messages.
@@ -1505,6 +1582,7 @@ impl<A: Auth> ConversationActor<A> {
         auth: A,
         client: SessionClient,
         conversation: Arc<dyn CodexConversationImpl>,
+        models_manager: Arc<dyn ModelsManagerImpl>,
         config: Config,
         message_rx: mpsc::UnboundedReceiver<ConversationMessage>,
     ) -> Self {
@@ -1514,6 +1592,7 @@ impl<A: Auth> ConversationActor<A> {
             conversation,
             config,
             custom_prompts: Rc::default(),
+            models_manager,
             submissions: HashMap::new(),
             message_rx,
         }
@@ -1544,7 +1623,7 @@ impl<A: Auth> ConversationActor<A> {
     async fn handle_message(&mut self, message: ConversationMessage) {
         match message {
             ConversationMessage::Load { response_tx } => {
-                let result = self.handle_load();
+                let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
                 let mut available_commands = Self::builtin_commands();
@@ -1562,16 +1641,19 @@ impl<A: Auth> ConversationActor<A> {
                         .unwrap_or_default();
 
                     for prompt in &new_custom_prompts {
-                        let mut command = AvailableCommand::new(
-                            prompt.name.clone(),
-                            prompt.description.clone().unwrap_or_default(),
+                        available_commands.push(
+                            AvailableCommand::new(
+                                prompt.name.clone(),
+                                prompt.description.clone().unwrap_or_default(),
+                            )
+                            .input(prompt.argument_hint.as_ref().map(
+                                |hint| {
+                                    AvailableCommandInput::Unstructured(
+                                        UnstructuredCommandInput::new(hint.clone()),
+                                    )
+                                },
+                            )),
                         );
-                        if let Some(hint) = &prompt.argument_hint {
-                            command = command.input(AvailableCommandInput::Unstructured(
-                                UnstructuredCommandInput::new(hint.clone()),
-                            ));
-                        }
-                        available_commands.push(command);
                     }
                     std::mem::swap(
                         custom_prompts.borrow_mut().deref_mut(),
@@ -1678,10 +1760,12 @@ impl<A: Auth> ConversationActor<A> {
         ))
     }
 
-    fn find_current_model(&self) -> Option<ModelId> {
-        let preset = MODEL_PRESETS
+    async fn find_current_model(&self) -> Option<ModelId> {
+        let model_presets = self.models_manager.list_models(&self.config).await;
+        let config_model = self.get_current_model().await;
+        let preset = model_presets
             .iter()
-            .find(|preset| preset.model == self.config.model)?;
+            .find(|preset| preset.model == config_model)?;
 
         let effort = self
             .config
@@ -1694,10 +1778,10 @@ impl<A: Auth> ConversationActor<A> {
             })
             .unwrap_or(preset.default_reasoning_effort);
 
-        Some(Self::model_id(preset.id, effort))
+        Some(Self::model_id(&preset.id, effort))
     }
 
-    fn model_id(id: &'static str, effort: ReasoningEffort) -> ModelId {
+    fn model_id(id: &str, effort: ReasoningEffort) -> ModelId {
         ModelId::new(format!("{id}/{effort}"))
     }
 
@@ -1707,45 +1791,56 @@ impl<A: Auth> ConversationActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
-    fn models(&self) -> Result<SessionModelState, Error> {
-        let current_model_id = self.find_current_model().unwrap_or_else(|| {
+    async fn models(&self) -> Result<SessionModelState, Error> {
+        let mut available_models = Vec::new();
+
+        let current_model_id = if let Some(model_id) = self.find_current_model().await {
+            model_id
+        } else {
             // If no preset found, return the current model string as-is
-            ModelId::new(self.config.model.clone())
-        });
+            let model_id = ModelId::new(self.get_current_model().await);
+            available_models.push(ModelInfo::new(
+                model_id.clone(),
+                if self.config.model_provider_id == "openai" {
+                    model_id.to_string()
+                } else {
+                    format!("{model_id} ({})", self.config.model_provider.name)
+                },
+            ));
+            model_id
+        };
 
         // If the user is using a custom provider, don't return the list
         if self.config.model_provider_id != "openai" {
             return Ok(SessionModelState::new(
                 current_model_id.clone(),
-                vec![ModelInfo::new(
-                    current_model_id.clone(),
-                    format!("{current_model_id} ({})", self.config.model_provider.name),
-                )],
+                available_models,
             ));
         }
 
-        let available_models = MODEL_PRESETS
-            .iter()
-            .flat_map(|preset| {
-                preset.supported_reasoning_efforts.iter().map(|effort| {
-                    ModelInfo::new(
-                        Self::model_id(preset.id, effort.effort),
-                        format!("{} ({})", preset.display_name, effort.effort),
-                    )
-                    .description(format!("{} {}", preset.description, effort.description))
-                })
-            })
-            .collect();
+        available_models.extend(
+            self.models_manager
+                .list_models(&self.config)
+                .await
+                .iter()
+                .flat_map(|preset| {
+                    preset.supported_reasoning_efforts.iter().map(|effort| {
+                        ModelInfo::new(
+                            Self::model_id(&preset.id, effort.effort),
+                            format!("{} ({})", preset.display_name, effort.effort),
+                        )
+                        .description(format!("{} {}", preset.description, effort.description))
+                    })
+                }),
+        );
 
         Ok(SessionModelState::new(current_model_id, available_models))
     }
 
-    fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
-        let mut response = LoadSessionResponse::new().models(self.models()?);
-        if let Some(modes) = self.modes() {
-            response = response.modes(modes);
-        }
-        Ok(response)
+    async fn handle_load(&mut self) -> Result<LoadSessionResponse, Error> {
+        Ok(LoadSessionResponse::new()
+            .models(self.models().await?)
+            .modes(self.modes()))
     }
 
     async fn handle_prompt(
@@ -1886,19 +1981,25 @@ impl<A: Auth> ConversationActor<A> {
         Ok(())
     }
 
+    async fn get_current_model(&self) -> String {
+        self.models_manager
+            .get_model(&self.config.model, &self.config)
+            .await
+    }
+
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
         // Try parsing as preset format, otherwise use as-is, fallback to config
-        let (model_to_use, effort_to_use) = Self::parse_model_id(&model)
-            .map(|(m, e)| (m, Some(e)))
-            .unwrap_or_else(|| {
-                let model_str = model.0.to_string();
-                let fallback = if !model_str.is_empty() {
-                    model_str
-                } else {
-                    self.config.model.clone()
-                };
-                (fallback, self.config.model_reasoning_effort)
-            });
+        let (model_to_use, effort_to_use) = if let Some((m, e)) = Self::parse_model_id(&model) {
+            (m, Some(e))
+        } else {
+            let model_str = model.0.to_string();
+            let fallback = if !model_str.is_empty() {
+                model_str
+            } else {
+                self.get_current_model().await
+            };
+            (fallback, self.config.model_reasoning_effort)
+        };
 
         if model_to_use.is_empty() {
             return Err(Error::invalid_params().data("No model parsed or configured"));
@@ -1916,7 +2017,7 @@ impl<A: Auth> ConversationActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        self.config.model = model_to_use;
+        self.config.model = Some(model_to_use);
         self.config.model_reasoning_effort = effort_to_use;
 
         match self.models() {
@@ -2005,37 +2106,25 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
     ToolCallContent::Content(Content::new(match content {
         mcp_types::ContentBlock::TextContent(mcp_types::TextContent {
             annotations, text, ..
-        }) => {
-            let mut text_content = TextContent::new(text);
-            if let Some(annotations) = annotations {
-                text_content = text_content.annotations(convert_annotations(annotations))
-            }
-            ContentBlock::Text(text_content)
-        }
+        }) => ContentBlock::Text(
+            TextContent::new(text).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::ImageContent(mcp_types::ImageContent {
             annotations,
             data,
             mime_type,
             ..
-        }) => {
-            let mut image_content = ImageContent::new(data, mime_type);
-            if let Some(annotations) = annotations {
-                image_content = image_content.annotations(convert_annotations(annotations));
-            }
-            ContentBlock::Image(image_content)
-        }
+        }) => ContentBlock::Image(
+            ImageContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::AudioContent(mcp_types::AudioContent {
             annotations,
             data,
             mime_type,
             ..
-        }) => {
-            let mut audio_content = AudioContent::new(data, mime_type);
-            if let Some(annotations) = annotations {
-                audio_content = audio_content.annotations(convert_annotations(annotations));
-            };
-            ContentBlock::Audio(audio_content)
-        }
+        }) => ContentBlock::Audio(
+            AudioContent::new(data, mime_type).annotations(annotations.map(convert_annotations)),
+        ),
         mcp_types::ContentBlock::ResourceLink(mcp_types::ResourceLink {
             annotations,
             description,
@@ -2045,25 +2134,14 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
             title,
             uri,
             ..
-        }) => {
-            let mut resource_link = ResourceLink::new(name, uri);
-            if let Some(annotations) = annotations {
-                resource_link = resource_link.annotations(convert_annotations(annotations));
-            };
-            if let Some(description) = description {
-                resource_link = resource_link.description(description);
-            };
-            if let Some(mime_type) = mime_type {
-                resource_link = resource_link.mime_type(mime_type);
-            };
-            if let Some(size) = size {
-                resource_link = resource_link.size(size);
-            };
-            if let Some(title) = title {
-                resource_link = resource_link.title(title);
-            };
-            ContentBlock::ResourceLink(resource_link)
-        }
+        }) => ContentBlock::ResourceLink(
+            ResourceLink::new(name, uri)
+                .annotations(annotations.map(convert_annotations))
+                .description(description)
+                .mime_type(mime_type)
+                .size(size)
+                .title(title),
+        ),
         mcp_types::ContentBlock::EmbeddedResource(mcp_types::EmbeddedResource {
             annotations,
             resource,
@@ -2076,32 +2154,22 @@ fn codex_content_to_acp_content(content: mcp_types::ContentBlock) -> ToolCallCon
                         text,
                         uri,
                     },
-                ) => {
-                    let mut text_resource_contents = TextResourceContents::new(text, uri);
-                    if let Some(mime_type) = mime_type {
-                        text_resource_contents = text_resource_contents.mime_type(mime_type);
-                    };
-                    EmbeddedResourceResource::TextResourceContents(text_resource_contents)
-                }
+                ) => EmbeddedResourceResource::TextResourceContents(
+                    TextResourceContents::new(text, uri).mime_type(mime_type),
+                ),
                 mcp_types::EmbeddedResourceResource::BlobResourceContents(
                     mcp_types::BlobResourceContents {
                         blob,
                         mime_type,
                         uri,
                     },
-                ) => {
-                    let mut blob_resource_contents = BlobResourceContents::new(blob, uri);
-                    if let Some(mime_type) = mime_type {
-                        blob_resource_contents = blob_resource_contents.mime_type(mime_type);
-                    }
-                    EmbeddedResourceResource::BlobResourceContents(blob_resource_contents)
-                }
+                ) => EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new(blob, uri).mime_type(mime_type),
+                ),
             };
-            let mut embedded_resource = EmbeddedResource::new(resource);
-            if let Some(annotations) = annotations {
-                embedded_resource = embedded_resource.annotations(convert_annotations(annotations));
-            };
-            ContentBlock::Resource(embedded_resource)
+            ContentBlock::Resource(
+                EmbeddedResource::new(resource).annotations(annotations.map(convert_annotations)),
+            )
         }
     }))
 }
@@ -2113,25 +2181,17 @@ fn convert_annotations(
         priority,
     }: mcp_types::Annotations,
 ) -> Annotations {
-    let mut annotations = Annotations::new();
-    if let Some(audience) = audience {
-        annotations = annotations.audience(
-            audience
-                .into_iter()
+    Annotations::new()
+        .audience(audience.map(|a| {
+            a.into_iter()
                 .map(|audience| match audience {
                     mcp_types::Role::Assistant => agent_client_protocol::Role::Assistant,
                     mcp_types::Role::User => agent_client_protocol::Role::User,
                 })
-                .collect(),
-        );
-    }
-    if let Some(last_modified) = last_modified {
-        annotations = annotations.last_modified(last_modified);
-    }
-    if let Some(priority) = priority {
-        annotations = annotations.priority(priority);
-    }
-    annotations
+                .collect::<Vec<_>>()
+        }))
+        .last_modified(last_modified)
+        .priority(priority)
 }
 
 fn extract_tool_call_content_from_changes(
@@ -2178,7 +2238,10 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use codex_core::{config::ConfigOverrides, protocol::AgentMessageEvent};
+    use codex_core::{
+        config::ConfigOverrides, openai_models::model_presets::all_model_presets,
+        protocol::AgentMessageEvent,
+    };
     use tokio::{
         sync::{Mutex, mpsc::UnboundedSender},
         task::LocalSet,
@@ -2643,6 +2706,7 @@ mod tests {
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
         let conversation = Arc::new(StubCodexConversation::new());
+        let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides(vec![], ConfigOverrides::default()).await?;
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -2650,6 +2714,7 @@ mod tests {
             StubAuth,
             session_client,
             conversation.clone(),
+            models_manager,
             config,
             message_rx,
         );
@@ -2665,6 +2730,19 @@ mod tests {
     impl Auth for StubAuth {
         fn logout(&self) -> Result<bool, Error> {
             Ok(true)
+        }
+    }
+
+    struct StubModelsManager;
+
+    #[async_trait::async_trait]
+    impl ModelsManagerImpl for StubModelsManager {
+        async fn get_model(&self, _model_id: &Option<String>, _config: &Config) -> String {
+            all_model_presets()[0].to_owned().id
+        }
+
+        async fn list_models(&self, _config: &Config) -> Vec<ModelPreset> {
+            all_model_presets().to_owned()
         }
     }
 
