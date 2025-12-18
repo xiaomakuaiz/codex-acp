@@ -492,6 +492,23 @@ impl PromptState {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
             }
+            EventMsg::UndoStarted(event) => {
+                client
+                    .send_agent_text(
+                        event
+                            .message
+                            .unwrap_or_else(|| "Undo in progress...".to_string()),
+                    )
+                    .await;
+            }
+            EventMsg::UndoCompleted(event) => {
+                let fallback = if event.success {
+                    "Undo completed.".to_string()
+                } else {
+                    "Undo failed.".to_string()
+                };
+                client.send_agent_text(event.message.unwrap_or(fallback)).await;
+            }
             EventMsg::StreamError(StreamErrorEvent { message , codex_error_info}) => {
                 error!("Handled error during turn: {message} {codex_error_info:?}");
             }
@@ -576,11 +593,11 @@ impl PromptState {
             e @ (EventMsg::McpListToolsResponse(..)
             // returned from Op::ListCustomPrompts, ignore
             | EventMsg::ListCustomPromptsResponse(..)
+            | EventMsg::ListSkillsResponse(..)
             // Used for returning a single history entry
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::UndoStarted(..)
-            | EventMsg::UndoCompleted(..)) => {
+            ) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1270,7 +1287,6 @@ fn parse_command_tool_call(parsed_cmd: Vec<ParsedCommand>, cwd: &Path) -> ParseC
                     (Some(query), None) => format!("Search {query}"),
                     _ => format!("Search {cmd}"),
                 });
-                cmd_path = path.map(PathBuf::from);
                 kind = ToolKind::Search;
             }
             ParsedCommand::Unknown { cmd } => {
@@ -1326,6 +1342,25 @@ impl TaskState {
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
                 client.send_agent_thought(text).await;
+            }
+            EventMsg::UndoStarted(event) => {
+                client
+                    .send_agent_text(
+                        event
+                            .message
+                            .unwrap_or_else(|| "Undo in progress...".to_string()),
+                    )
+                    .await;
+            }
+            EventMsg::UndoCompleted(event) => {
+                let fallback = if event.success {
+                    "Undo completed.".to_string()
+                } else {
+                    "Undo failed.".to_string()
+                };
+                client
+                    .send_agent_text(event.message.unwrap_or(fallback))
+                    .await;
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1409,13 +1444,12 @@ impl TaskState {
             | EventMsg::GetHistoryEntryResponse(..)
             | EventMsg::McpListToolsResponse(..)
             | EventMsg::ListCustomPromptsResponse(..)
+            | EventMsg::ListSkillsResponse(..)
             | EventMsg::PlanUpdate(..)
             | EventMsg::EnteredReviewMode(..)
             | EventMsg::ExitedReviewMode(..)
             | EventMsg::DeprecationNotice(..)
-            | EventMsg::ElicitationRequest(..)
-            | EventMsg::UndoStarted(..)
-            | EventMsg::UndoCompleted(..)) => {
+            | EventMsg::ElicitationRequest(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
         }
@@ -1718,6 +1752,7 @@ impl<A: Auth> ConversationActor<A> {
                 "compact",
                 "summarize conversation to prevent hitting the context limit",
             ),
+            AvailableCommand::new("undo", "undo Codex’s most recent turn"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -1799,24 +1834,9 @@ impl<A: Auth> ConversationActor<A> {
         } else {
             // If no preset found, return the current model string as-is
             let model_id = ModelId::new(self.get_current_model().await);
-            available_models.push(ModelInfo::new(
-                model_id.clone(),
-                if self.config.model_provider_id == "openai" {
-                    model_id.to_string()
-                } else {
-                    format!("{model_id} ({})", self.config.model_provider.name)
-                },
-            ));
+            available_models.push(ModelInfo::new(model_id.clone(), model_id.to_string()));
             model_id
         };
-
-        // If the user is using a custom provider, don't return the list
-        if self.config.model_provider_id != "openai" {
-            return Ok(SessionModelState::new(
-                current_model_id.clone(),
-                available_models,
-            ));
-        }
 
         available_models.extend(
             self.models_manager
@@ -1854,6 +1874,7 @@ impl<A: Auth> ConversationActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
+                "undo" => op = Op::Undo,
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -1932,7 +1953,7 @@ impl<A: Auth> ConversationActor<A> {
         info!("Starting to wait for conversation events for submission_id: {submission_id}");
 
         let state = match op {
-            Op::Compact => SubmissionState::Task(TaskState::new(response_tx)),
+            Op::Compact | Op::Undo => SubmissionState::Task(TaskState::new(response_tx)),
             _ => SubmissionState::Prompt(PromptState::new(
                 self.conversation.clone(),
                 response_tx,
@@ -2319,6 +2340,56 @@ mod tests {
         ));
         let ops = conversation.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_undo() -> anyhow::Result<()> {
+        let (session_id, client, conversation, message_tx, local_set) = setup(vec![]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ConversationMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/undo".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(
+            notifications.len(),
+            2,
+            "notifications don't match {notifications:?}"
+        );
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Undo in progress..."
+        ));
+        assert!(matches!(
+            &notifications[1].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Undo completed."
+        ));
+
+        let ops = conversation.ops.lock().unwrap();
+        assert_eq!(ops.as_slice(), &[Op::Undo]);
 
         Ok(())
     }
@@ -2828,6 +2899,35 @@ mod tests {
                             msg: EventMsg::AgentMessage(AgentMessageEvent {
                                 message: "Compact task completed".to_string(),
                             }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                                last_agent_message: None,
+                            }),
+                        })
+                        .unwrap();
+                }
+                Op::Undo => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::UndoStarted(codex_core::protocol::UndoStartedEvent {
+                                message: Some("Undo in progress...".to_string()),
+                            }),
+                        })
+                        .unwrap();
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::UndoCompleted(
+                                codex_core::protocol::UndoCompletedEvent {
+                                    success: true,
+                                    message: Some("Undo completed.".to_string()),
+                                },
+                            ),
                         })
                         .unwrap();
                     self.op_tx
